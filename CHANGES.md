@@ -2,6 +2,8 @@
 
 ## Planned
 
+* Vertex attributes should throw errors if they are not initialized
+
 * subimage updates for textures
 * Optimize constructors/updates for textures, renderbuffers and framebuffers
 * Remove DDS parsing
