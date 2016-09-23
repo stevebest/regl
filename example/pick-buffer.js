@@ -1,17 +1,16 @@
 /*
-  tags: advanced
+  tags: advanced, fbo
 
   <p>
-  In this demo, it is shown how to implement 3D object picking using raycasting.
+  In this demo, it is shown how to implement 3D object picking using a pickBuffer.
   If you click on an object, an outline is drawn around it.
   </p>
- */
+*/
 
 const canvas = document.body.appendChild(document.createElement('canvas'))
 const fit = require('canvas-fit')
 const regl = require('../regl')({canvas: canvas})
 const mat4 = require('gl-mat4')
-const vec3 = require('gl-vec3')
 window.addEventListener('resize', fit(canvas), false)
 const bunny = require('bunny')
 const normals = require('angle-normals')
@@ -21,39 +20,26 @@ var mb = require('mouse-pressed')(canvas)
 var viewMatrix = new Float32Array([1, -0, 0, 0, 0, 0.876966655254364, 0.48055124282836914, 0, -0, -0.48055124282836914, 0.876966655254364, 0, 0, 0, -11.622776985168457, 1])
 var projectionMatrix = new Float32Array(16)
 
-// Below is a slightly modified version of this code:
-// https://github.com/substack/ray-triangle-intersection
-// It does intersection between ray and triangle.
-// With the original version, we had no way of accessing 't'
-// But we really needed that value.
-function intersectTriangle (out, pt, dir, tri) {
-  var EPSILON = 0.000001
-  var edge1 = [0, 0, 0]
-  var edge2 = [0, 0, 0]
-  var tvec = [0, 0, 0]
-  var pvec = [0, 0, 0]
-  var qvec = [0, 0, 0]
+/*
+  Instead of a floating point texture, we use a RGBA8 texture,
+  since floating point textures are not available on all devices.
 
-  vec3.subtract(edge1, tri[1], tri[0])
-  vec3.subtract(edge2, tri[2], tri[0])
+  The pick-buffer contains the ids of all the rendered objects.
 
-  vec3.cross(pvec, dir, edge2)
-  var det = vec3.dot(edge1, pvec)
+  So for every pixel in the pickBuffer, the id of the object that is
+  _foremost_ at that pixel is stored(thanks to the Z-buffer!). Thus, if
+  we click on a pixel with the mouse, we can easily retrieve the id of
+  the clicked object by using the pickBuffer.
 
-  if (det < EPSILON) return null
-  vec3.subtract(tvec, pt, tri[0])
-  var u = vec3.dot(tvec, pvec)
-  if (u < 0 || u > det) return null
-  vec3.cross(qvec, tvec, edge1)
-  var v = vec3.dot(dir, qvec)
-  if (v < 0 || u + v > det) return null
-
-  var t = vec3.dot(edge2, qvec) / det
-  out[0] = pt[0] + t * dir[0]
-  out[1] = pt[1] + t * dir[1]
-  out[2] = pt[2] + t * dir[2]
-  return t
-}
+  In this simple demo, we store the ID in the red channel of the pixel in the
+  pickBuffer. However, this means that only 255 objects are possible.
+  But you can get around this by packing the id into all the 4 channels of the RGBA
+  pixel. But to keep things simple, we refrain from doing this.
+ */
+const pickBuffer = regl.framebuffer({
+  colorType: 'uint8',
+  colorFormat: 'rgba'
+})
 
 //
 // Create plane geometry
@@ -167,6 +153,42 @@ const drawNormal = regl({
   }`
 })
 
+// everything rendered in this scope is rendered to the pickbuffer.
+const pickBufferWrite = regl({
+  framebuffer: pickBuffer
+})
+
+//
+// Simple shader that only outputs the id of the rendered object at
+// every fragment.
+//
+const writeId = regl({
+  frag: `
+  precision mediump float;
+
+  uniform float id;
+
+  void main () {
+    gl_FragColor = vec4(vec3(id / 255.0, 0.0, 0.0), 1.0);
+  }`,
+  vert: `
+  precision mediump float;
+
+  attribute vec3 position;
+  attribute vec3 normal;
+
+  uniform mat4 projection, view, model;
+
+  void main() {
+    vec4 worldSpacePosition = model * vec4(position, 1);
+    gl_Position = projection * view * worldSpacePosition;
+  }`,
+
+  uniforms: {
+    id: regl.prop('id')
+  }
+})
+
 // render the object slightly bigger than it should be.  this is used
 // to draw the outline.  but we don't write to the depth buffer.  this
 // allows us to draw the object(that we wish to draw the outline for)
@@ -258,65 +280,45 @@ var meshes = [
 
 var iSelectedMesh = -1
 
-// on click ,we raycast.
+// will be null, if mouse was not clicked this frame.
+// otherwise, it will contain the clicked mouse position.
+var clickedPos = null
+
 mb.on('down', function () {
-  var vp = mat4.multiply([], projectionMatrix, viewMatrix)
-  var invVp = mat4.invert([], vp)
-
-  // get a single point on the camera ray.
-  var rayPoint = vec3.transformMat4([], [2.0 * mp[0] / canvas.width - 1.0, -2.0 * mp[1] / canvas.height + 1.0, 0.0], invVp)
-
-  // get the position of the camera.
-  var rayOrigin = vec3.transformMat4([], [0, 0, 0], mat4.invert([], viewMatrix))
-
-  var rayDir = vec3.normalize([], vec3.subtract([], rayPoint, rayOrigin))
-
-  // now we iterate through all meshes, and find the closest mesh that intersects the camera ray.
-  var minT = 10000000.0
-  for (var i = 0; i < meshes.length; i++) {
-    var m = meshes[i]
-
-    var modelMatrix = createModelMatrix(m)
-
-    // we must check all triangles of the mesh.
-    for (var j = 0; j < m.mesh.elements.length; j++) {
-      if (m.mesh === planeMesh) {
-        continue // we don't allow clicking the plane mesh.
-      }
-      var f = m.mesh.elements[j]
-      // apply model matrix on the triangle.
-      var tri =
-          [vec3.transformMat4([], m.mesh.position[f[0]], modelMatrix),
-           vec3.transformMat4([], m.mesh.position[f[1]], modelMatrix),
-           vec3.transformMat4([], m.mesh.position[f[2]], modelMatrix)
-      ]
-      var res = []
-      var t = intersectTriangle(res, rayPoint, rayDir, tri)
-      if (t !== null) {
-        if (t < minT) {
-          // mesh was closer than any object thus far.
-          // for the time being, make it the selected object.
-          minT = t
-          iSelectedMesh = i
-          break
-        }
-      }
-    }
-  }
+  clickedPos = [mp[0], mp[1]]
 })
 
-regl.frame(({tick}) => {
-  regl.clear({
-    color: [0, 0, 0, 255],
-    depth: 1
-  })
+regl.frame(({viewportWidth, viewportHeight}) => {
+  pickBuffer.resize(viewportWidth, viewportHeight)
 
   globalScope(() => {
+    // first render to the pickBuffer.
+    pickBufferWrite(() => {
+      regl.clear({
+        color: [0, 0, 0, 255],
+        depth: 1
+      })
+      for (var i = 0; i < meshes.length; i++) {
+        m = meshes[i]
+        if (m !== planeMesh) { // do not allow clicking on the plane.
+          writeId({id: i}, () => {
+            m.mesh.draw(m)
+          })
+        }
+      }
+    })
+
+    // then we render normally.
+    regl.clear({
+      color: [0, 0, 0, 255],
+      depth: 1
+    })
+
     var m
     for (var i = 0; i < meshes.length; i++) {
       m = meshes[i]
       if (i !== iSelectedMesh) {
-        // then draw object normally.
+        // if not selected, draw object normally.
         drawNormal(() => {
           m.mesh.draw(m)
         })
@@ -338,4 +340,21 @@ regl.frame(({tick}) => {
       })
     }
   })
+
+  // last, we handle object picking logic.
+  if (clickedPos !== null) {
+    // first, read from pickBuffer
+    var pixels
+    regl({framebuffer: pickBuffer})(() => {
+      pixels = regl.read()
+    })
+
+    // get id at clicked position.
+    var clickId = pixels[(canvas.width * (canvas.height - clickedPos[1]) + clickedPos[0]) * 4]
+
+    if (clickId !== 0) { // empty pixels are 0. Because they are not written to.
+      iSelectedMesh = clickId
+    }
+    clickedPos = null
+  }
 })
